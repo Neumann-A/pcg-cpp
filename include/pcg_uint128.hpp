@@ -126,6 +126,41 @@ inline bitcount_t trailingzeros(uint64_t v)
     #error Cannot find a function for uint64_t
 #endif
 }
+#elif _MSC_VER >= 1900 // Visual Studio also has some useful intrinsics. 
+					   //(Version check might be too high but I couldn't check lower versions)
+#include <immintrin.h>
+
+	inline bitcount_t flog2(uint32_t v)
+	{
+		return 31 - _lzcnt_u32(v);
+	}
+
+	inline bitcount_t trailingzeros(uint32_t v)
+	{
+		return _tzcnt_u32(v);
+	}
+
+	inline bitcount_t flog2(uint64_t v)
+	{
+#if UINT64_MAX == ULONG_MAX
+		return static_cast<bitcount_t>(63 - _lzcnt_u32(v));
+#elif UINT64_MAX == ULLONG_MAX
+		return static_cast<bitcount_t>(63 - _lzcnt_u64(v));
+#else
+#error Cannot find a function for uint64_t
+#endif
+	}
+
+	inline bitcount_t trailingzeros(const uint64_t& v)
+	{
+#if UINT64_MAX == ULONG_MAX
+		return static_cast<bitcount_t>(_tzcnt_u32(v));
+#elif UINT64_MAX == ULLONG_MAX
+		return static_cast<bitcount_t>(_tzcnt_u64(v));
+#else
+#error Cannot find a function for uint64_t
+#endif
+	}
 
 #else                   // Otherwise, we fall back to bit twiddling
                         // implementations
@@ -156,7 +191,7 @@ inline bitcount_t trailingzeros(uint32_t v)
       31, 27, 13, 23, 21, 19, 16, 7, 26, 12, 18, 6, 11, 5, 10, 9
     };
 
-    return multiplyDeBruijnBitPos[((uint32_t)((v & -v) * 0x077CB531U)) >> 27];
+    return multiplyDeBruijnBitPos[((uint32_t)((v & static_cast<uint32_t>(-static_cast<int32_t>(v))) * 0x077CB531U)) >> 27];
 }
 
 inline bitcount_t flog2(uint64_t v)
@@ -229,41 +264,65 @@ public:
     };
 
 public:
-    uint_x4() = default;
+	constexpr uint_x4() = default;
 
     constexpr uint_x4(UInt v3, UInt v2, UInt v1, UInt v0)
 #if PCG_LITTLE_ENDIAN
-       : w{v0, v1, v2, v3}
+       : wa{v0, v1, v2, v3}
 #else
-       : w{v3, v2, v1, v0}
+       : wa{v3, v2, v1, v0}
 #endif
     {
         // Nothing (else) to do
     }
 
-    constexpr uint_x4(UIntX2 v23, UIntX2 v01)
-#if PCG_LITTLE_ENDIAN
-       : d{v01,v23}
-#else
-       : d{v23,v01}
-#endif
-    {
-        // Nothing (else) to do
-    }
+//    constexpr uint_x4(UIntX2 v23, UIntX2 v01)
+//#if PCG_LITTLE_ENDIAN
+//       : d{v01,v23}
+//#else
+//       : d{v23,v01}
+//#endif
+//    {
+//        // Nothing (else) to do
+//    }
 
-    template<class Integral,
-             typename std::enable_if<(std::is_integral<Integral>::value
-                                      && sizeof(Integral) <= sizeof(UIntX2))
-                                    >::type* = nullptr>
-    constexpr uint_x4(Integral v01)
+	constexpr uint_x4(UIntX2 v23, UIntX2 v01)
 #if PCG_LITTLE_ENDIAN
-       : d{UIntX2(v01),0UL}
+		//: d{ v01,v23 }
+		: wa{ UInt(v01),UInt(v01 >> 32),UInt(v23),UInt(v23 >> 32) }
 #else
-       : d{0UL,UIntX2(v01)}
+		: wa{ UInt(v23 >> 32),UInt(v23),UInt(v01 >> 32),UInt(v01) }
 #endif
-    {
-        // Nothing (else) to do
-    }
+	{
+		// Nothing (else) to do
+	}
+//    template<class Integral,
+//             typename std::enable_if<(std::is_integral<Integral>::value
+//                                      && sizeof(Integral) <= sizeof(UIntX2) && sizeof(Integral) > sizeof(UInt))
+//                                    >::type* = nullptr>
+//    constexpr uint_x4(Integral v01)
+//#if PCG_LITTLE_ENDIAN
+//       : d{UIntX2(v01),0UL}
+//#else
+//       : d{0UL,UIntX2(v01)}
+//#endif
+//    {
+//        // Nothing (else) to do
+//    }
+
+	template<class Integral,
+		typename std::enable_if<(std::is_integral<Integral>::value
+			&& sizeof(Integral) <= sizeof(UInt))
+	>::type* = nullptr>
+	constexpr uint_x4(Integral v0)
+#if PCG_LITTLE_ENDIAN
+		: wa{ UInt(v0),UInt(0),UInt(0),UInt(0) }
+#else
+		: wa{ UInt(0),UInt(0),UInt(0),UInt(v0) }
+#endif
+	{
+		// Nothing (else) to do
+	}
 
     explicit constexpr operator uint64_t() const
     {
@@ -320,10 +379,10 @@ public:
     friend uint_x4<U,V> operator-(const uint_x4<U,V>&, const uint_x4<U,V>&);
 
     template<typename U, typename V>
-    friend uint_x4<U,V> operator<<(const uint_x4<U,V>&, const uint_x4<U,V>&);
+    constexpr friend uint_x4<U,V> operator<<(const uint_x4<U,V>&, const bitcount_t&);
 
     template<typename U, typename V>
-    friend uint_x4<U,V> operator>>(const uint_x4<U,V>&, const uint_x4<U,V>&);
+    friend uint_x4<U,V> operator>>(const uint_x4<U,V>&, const bitcount_t&);
 
     template<typename U, typename V>
     friend uint_x4<U,V> operator&(const uint_x4<U,V>&, const uint_x4<U,V>&);
@@ -674,14 +733,15 @@ bool operator>=(const uint_x4<UInt,UIntX2>& a, const uint_x4<UInt,UIntX2>& b)
 
 
 template <typename UInt, typename UIntX2>
-uint_x4<UInt,UIntX2> operator<<(const uint_x4<UInt,UIntX2>& v,
-                                const bitcount_t shift)
+constexpr uint_x4<UInt,UIntX2> operator<<(const uint_x4<UInt,UIntX2>& v,
+                                const bitcount_t& shift)
 {
     uint_x4<UInt,UIntX2> r = {0U, 0U, 0U, 0U};
-    const bitcount_t bits    = sizeof(UInt) * CHAR_BIT;
-    const bitcount_t bitmask = bits - 1;
-    const bitcount_t shiftdiv = shift / bits;
-    const bitcount_t shiftmod = shift & bitmask;
+    constexpr const bitcount_t bits    = sizeof(UInt) * CHAR_BIT;
+	constexpr const bitcount_t bitmask = (bits - 1);
+	//constexpr const bitcount_t shift2 = shift;
+	const bitcount_t shiftdiv = (shift / bits);
+	const bitcount_t shiftmod = (shift & bitmask);
 
     if (shiftmod) {
         UInt carryover = 0;
@@ -691,7 +751,7 @@ uint_x4<UInt,UIntX2> operator<<(const uint_x4<UInt,UIntX2>& v,
         for (uint8_t out = 4-shiftdiv, in = 4; out != 0; /* dec in loop */) {
             --out, --in;
 #endif
-            r.wa[out] = (v.wa[in] << shiftmod) | carryover;
+			r.wa[out] = (v.wa[in] << shiftmod) | carryover;
             carryover = (v.wa[in] >> (bits - shiftmod));
         }
     } else {

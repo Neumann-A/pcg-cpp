@@ -661,7 +661,8 @@ itype engine<xtype,itype,output_mixin,output_previous,stream_mixin,
     itype the_bit = stream_mixin::is_mcg ? itype(4u) : itype(1u);
     itype distance = 0u;
     while ((cur_state & mask) != (newstate & mask)) {
-       if ((cur_state & the_bit) != (newstate & the_bit)) {
+       if ((cur_state & the_bit) != (newstate & the_bit)) 
+	   {
            cur_state = cur_state * cur_mult + cur_plus;
            distance |= the_bit;
        }
@@ -1193,8 +1194,7 @@ private:
             // The low order bits of an MCG are constant, so drop them.
             state >>= 2;
         }
-        size_t index       = kdd ? state &  table_mask
-                                 : state >> table_shift;
+        size_t index       = kdd ? static_cast<std::size_t>(state & table_mask) : static_cast<std::size_t>(state >> table_shift);
 
         if (may_tick) {
             bool tick = kdd ? (state & tick_mask) == state_type(0u)
