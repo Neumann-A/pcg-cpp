@@ -1,6 +1,5 @@
 @PACKAGE_INIT@
 
-include ("${CMAKE_CURRENT_LIST_DIR}/pcg-cppTargets.cmake")
 get_filename_component(PCG_CMAKE_DIR "${CMAKE_CURRENT_LIST_FILE}" PATH)
 set(PCG_INCLUDE_DIRS "@INCLUDE_INSTALL_DIR@")
 message(STATUS "PCG found. Headers: ${PCG_INCLUDE_DIRS}")
