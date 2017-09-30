@@ -6,24 +6,24 @@ set(HEADERS "include/pcg_extras.hpp;include/pcg_random.hpp;include/pcg_uint128.h
 
 SET(CMAKE_MODULE_PATH ${CMAKE_CURRENT_SOURCE_DIR}/cmake)
 
-set(PCG_MAJOR_VERSION "1")
-set(PCG_MINOR_VERSION "1")
-set(PCG_PATCH_VERSION "0")
+set(PCG_MAJOR_VERSION "0")
+set(PCG_MINOR_VERSION "98")
+set(PCG_PATCH_VERSION "1")
 set(PCG_VERSION_STRING "${PCG_MAJOR_VERSION}.${PCG_MINOR_VERSION}.${PCG_PATCH_VERSION}")
 
 add_library(${PROJECT_NAME} INTERFACE)
+include_directories(${CMAKE_CURRENT_SOURCE_DIR}/include)
+#set_target_properties (${PROJECT_NAME} PROPERTIES FOLDER pcg)
 
-set_target_properties (${PROJECT_NAME} PROPERTIES FOLDER pcg)
-
-target_compile_features(${PROJECT_NAME} PRIVATE cxx_constexpr)
+target_compile_features(${PROJECT_NAME} INTERFACE cxx_constexpr)
 
 #Export as Package
 
 export(PACKAGE ${PROJECT_NAME})
-CONFIGURE_FILE(${PROJECT_NAME}Config.cmake.in
+CONFIGURE_FILE(${CMAKE_MODULE_PATH}/${PROJECT_NAME}Config.cmake.in
     ${PROJECT_NAME}Config.cmake
     @ONLY)
-CONFIGURE_FILE(${PROJECT_NAME}ConfigVersion.cmake.in
+CONFIGURE_FILE(${CMAKE_MODULE_PATH}/${PROJECT_NAME}ConfigVersion.cmake.in
     ${PROJECT_NAME}ConfigVersion.cmake
     @ONLY)
 INSTALL(FILES
