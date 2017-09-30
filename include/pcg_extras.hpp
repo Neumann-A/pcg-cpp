@@ -83,10 +83,10 @@
 #else
     #include "pcg_uint128.hpp"
     namespace pcg_extras {
-        typedef pcg_extras::uint_x4<uint32_t,uint64_t> pcg128_t;
+        typedef pcg_extras::uint128 pcg128_t;
     }
     #define PCG_128BIT_CONSTANT(high,low) \
-            pcg128_t(high,low)
+            pcg128_t{high,low}
     #define PCG_EMULATED_128BIT_MATH 1
 #endif
 
@@ -116,49 +116,49 @@ namespace pcg_extras {
  * and zero-padded in hex.  It's not a full-featured implementation.
  */
 
-template <typename CharT, typename Traits>
-std::basic_ostream<CharT,Traits>&
-operator<<(std::basic_ostream<CharT,Traits>& out, pcg128_t value)
-{
-    auto desired_base = out.flags() & out.basefield;
-    bool want_hex = desired_base == out.hex;
-
-    if (want_hex) {
-        uint64_t highpart = uint64_t(value >> 64);
-        uint64_t lowpart  = uint64_t(value);
-        auto desired_width = out.width();
-        if (desired_width > 16) {
-            out.width(desired_width - 16);
-        }
-        if (highpart != 0 || desired_width > 16)
-            out << highpart;
-        CharT oldfill = '\0';
-        if (highpart != 0) {
-            out.width(16);
-            oldfill = out.fill('0');
-        }
-        auto oldflags = out.setf(decltype(desired_base){}, out.showbase);
-        out << lowpart;
-        out.setf(oldflags);
-        if (highpart != 0) {
-            out.fill(oldfill);
-        }
-        return out;
-    }
-    constexpr size_t MAX_CHARS_128BIT = 40;
-
-    char buffer[MAX_CHARS_128BIT];
-    char* pos = buffer+sizeof(buffer);
-    *(--pos) = '\0';
-    constexpr auto BASE = pcg128_t(10ULL);
-    do {
-        auto div = value / BASE;
-        auto mod = uint32_t(value - (div * BASE));
-        *(--pos) = '0' + char(mod);
-        value = div;
-    } while(value != pcg128_t(0ULL));
-    return out << pos;
-}
+//template <typename CharT, typename Traits>
+//std::basic_ostream<CharT,Traits>&
+//operator<<(std::basic_ostream<CharT,Traits>& out, pcg128_t value)
+//{
+//    auto desired_base = out.flags() & out.basefield;
+//    bool want_hex = desired_base == out.hex;
+//
+//    if (want_hex) {
+//        uint64_t highpart = uint64_t(value >> 64);
+//        uint64_t lowpart  = uint64_t(value);
+//        auto desired_width = out.width();
+//        if (desired_width > 16) {
+//            out.width(desired_width - 16);
+//        }
+//        if (highpart != 0 || desired_width > 16)
+//            out << highpart;
+//        CharT oldfill = '\0';
+//        if (highpart != 0) {
+//            out.width(16);
+//            oldfill = out.fill('0');
+//        }
+//        auto oldflags = out.setf(decltype(desired_base){}, out.showbase);
+//        out << lowpart;
+//        out.setf(oldflags);
+//        if (highpart != 0) {
+//            out.fill(oldfill);
+//        }
+//        return out;
+//    }
+//    constexpr size_t MAX_CHARS_128BIT = 40;
+//
+//    char buffer[MAX_CHARS_128BIT];
+//    char* pos = buffer+sizeof(buffer);
+//    *(--pos) = '\0';
+//    constexpr auto BASE = pcg128_t(10ULL);
+//    do {
+//        auto div = value / BASE;
+//        auto mod = uint32_t(value - (div * BASE));
+//        *(--pos) = '0' + char(mod);
+//        value = div;
+//    } while(value != pcg128_t(0ULL));
+//    return out << pos;
+//}
 
 template <typename CharT, typename Traits>
 std::basic_istream<CharT,Traits>&

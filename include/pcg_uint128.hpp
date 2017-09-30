@@ -20,17 +20,17 @@
  */
 
 /*
- * This code provides a a C++ class that can provide 128-bit (or higher)
- * integers.  To produce 2K-bit integers, it uses two K-bit integers,
- * placed in a union that allowes the code to also see them as four K/2 bit
- * integers (and access them either directly name, or by index).
+ * Due to constexpr compilation errors with VS 2017 the pcg 128-bit code was replaced
+ * by the one from googles abseil library. The uint128 type of abseil was changed to
+ * make it mostly constexpr and header only. The following changes where made:
+ *	- most functions are now declared constexpr and inline
+ *	  (This was needed to make pcg compile with VS 2017; 
+ *		with clang-cl there were no issues)
+ *	- the abseil makros needed for uint128 have been copied into this file
+ *  - functions declared in the int128.hpp have also been moved into this file
+ *	- there are also smaller other changes which i dont remember
  *
- * It may seem like we're reinventing the wheel here, because several
- * libraries already exist that support large integers, but most existing
- * libraries provide a very generic multiprecision code, but here we're
- * operating at a fixed size.  Also, most other libraries are fairly
- * heavyweight.  So we use a direct implementation.  Sadly, it's much slower
- * than hand-coded assembly or direct CPU support.
+ * Alexander Neumann
  */
 
 #ifndef PCG_UINT128_HPP_INCLUDED
@@ -40,708 +40,874 @@
 #include <cstdio>
 #include <cassert>
 #include <climits>
-#include <utility>
-#include <initializer_list>
+#include <iosfwd>
+#include <iomanip>
+#include <sstream>
+#include <cmath>
+#include <cstring>
+#include <limits>
 #include <type_traits>
-
-/*
- * We want to lay the type out the same way that a native type would be laid
- * out, which means we must know the machine's endian, at compile time.
- * This ugliness attempts to do so.
- */
-
-#ifndef PCG_LITTLE_ENDIAN
-    #if defined(__BYTE_ORDER__)
-        #if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
-            #define PCG_LITTLE_ENDIAN 1
-        #elif __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
-            #define PCG_LITTLE_ENDIAN 0
-        #else
-            #error __BYTE_ORDER__ does not match a standard endian, pick a side
-        #endif
-    #elif __LITTLE_ENDIAN__ || _LITTLE_ENDIAN
-        #define PCG_LITTLE_ENDIAN 1
-    #elif __BIG_ENDIAN__ || _BIG_ENDIAN
-        #define PCG_LITTLE_ENDIAN 0
-    #elif __x86_64 || __x86_64__ || _M_X64 || __i386 || __i386__ || _M_IX86
-        #define PCG_LITTLE_ENDIAN 1
-    #elif __powerpc__ || __POWERPC__ || __ppc__ || __PPC__ \
-          || __m68k__ || __mc68000__
-        #define PCG_LITTLE_ENDIAN 0
-    #else
-        #error Unable to determine target endianness
-    #endif
-#endif
 
 namespace pcg_extras {
 
-// Recent versions of GCC have intrinsics we can use to quickly calculate
-// the number of leading and trailing zeros in a number.  If possible, we
-// use them, otherwise we fall back to old-fashioned bit twiddling to figure
-// them out.
+//
+// Copyright 2017 The Abseil Authors and modified by Alexander Neumann
+// for usage in pcg random. Fixed compilation issues with Visual Studio 2017
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
 
-#ifndef PCG_BITCOUNT_T
-    typedef uint8_t bitcount_t;
+
+// ABSL_IS_LITTLE_ENDIAN
+// ABSL_IS_BIG_ENDIAN
+//
+// Checks the endianness of the platform.
+//
+// Notes: uses the built in endian macros provided by GCC (since 4.6) and
+// Clang (since 3.2); see
+// https://gcc.gnu.org/onlinedocs/cpp/Common-Predefined-Macros.html.
+// Otherwise, if _WIN32, assume little endian. Otherwise, bail with an error.
+#if defined(ABSL_IS_BIG_ENDIAN)
+#error "ABSL_IS_BIG_ENDIAN cannot be directly set."
+#endif
+#if defined(ABSL_IS_LITTLE_ENDIAN)
+#error "ABSL_IS_LITTLE_ENDIAN cannot be directly set."
+#endif
+
+#if (defined(__BYTE_ORDER__) && defined(__ORDER_LITTLE_ENDIAN__) && \
+     __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__)
+#define ABSL_IS_LITTLE_ENDIAN 1
+#elif defined(__BYTE_ORDER__) && defined(__ORDER_BIG_ENDIAN__) && \
+    __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+#define ABSL_IS_BIG_ENDIAN 1
+#elif defined(_WIN32)
+#define ABSL_IS_LITTLE_ENDIAN 1
 #else
-    typedef PCG_BITCOUNT_T bitcount_t;
+#error "absl endian detection needs to be set up for your compiler"
 #endif
 
-/*
- * Provide some useful helper functions
- *      * flog2                 floor(log2(x))
- *      * trailingzeros         number of trailing zero bits
- */
 
-#ifdef __GNUC__         // Any GNU-compatible compiler supporting C++11 has
-                        // some useful intrinsics we can use.
-
-inline bitcount_t flog2(uint32_t v)
-{
-    return 31 - __builtin_clz(v);
-}
-
-inline bitcount_t trailingzeros(uint32_t v)
-{
-    return __builtin_ctz(v);
-}
-
-inline bitcount_t flog2(uint64_t v)
-{
-#if UINT64_MAX == ULONG_MAX
-    return 63 - __builtin_clzl(v);
-#elif UINT64_MAX == ULLONG_MAX
-    return 63 - __builtin_clzll(v);
-#else
-    #error Cannot find a function for uint64_t
-#endif
-}
-
-inline bitcount_t trailingzeros(uint64_t v)
-{
-#if UINT64_MAX == ULONG_MAX
-    return __builtin_ctzl(v);
-#elif UINT64_MAX == ULLONG_MAX
-    return __builtin_ctzll(v);
-#else
-    #error Cannot find a function for uint64_t
-#endif
-}
-
-#else                   // Otherwise, we fall back to bit twiddling
-                        // implementations
-
-inline bitcount_t flog2(uint32_t v)
-{
-    // Based on code by Eric Cole and Mark Dickinson, which appears at
-    // https://graphics.stanford.edu/~seander/bithacks.html#IntegerLogDeBruijn
-
-    static const uint8_t multiplyDeBruijnBitPos[32] = {
-      0, 9, 1, 10, 13, 21, 2, 29, 11, 14, 16, 18, 22, 25, 3, 30,
-      8, 12, 20, 28, 15, 17, 24, 7, 19, 27, 23, 6, 26, 5, 4, 31
-    };
-
-    v |= v >> 1; // first round down to one less than a power of 2
-    v |= v >> 2;
-    v |= v >> 4;
-    v |= v >> 8;
-    v |= v >> 16;
-
-    return multiplyDeBruijnBitPos[(uint32_t)(v * 0x07C4ACDDU) >> 27];
-}
-
-inline bitcount_t trailingzeros(uint32_t v)
-{
-    static const uint8_t multiplyDeBruijnBitPos[32] = {
-      0, 1, 28, 2, 29, 14, 24, 3, 30, 22, 20, 15, 25, 17, 4, 8,
-      31, 27, 13, 23, 21, 19, 16, 7, 26, 12, 18, 6, 11, 5, 10, 9
-    };
-
-    return multiplyDeBruijnBitPos[((uint32_t)((v & -v) * 0x077CB531U)) >> 27];
-}
-
-inline bitcount_t flog2(uint64_t v)
-{
-    uint32_t high = v >> 32;
-    uint32_t low  = uint32_t(v);
-
-    return high ? 32+flog2(high) : flog2(low);
-}
-
-inline bitcount_t trailingzeros(uint64_t v)
-{
-    uint32_t high = v >> 32;
-    uint32_t low  = uint32_t(v);
-
-    return low ? trailingzeros(low) : trailingzeros(high)+32;
-}
-
+// ABSL_HAVE_INTRINSIC_INT128
+//
+// Checks whether the __int128 compiler extension for a 128-bit integral type is
+// supported.
+//
+// Notes: __SIZEOF_INT128__ is defined by Clang and GCC when __int128 is
+// supported, except on ppc64 and aarch64 where __int128 exists but has exhibits
+// a sporadic compiler crashing bug. Nvidia's nvcc also defines __GNUC__ and
+// __SIZEOF_INT128__ but not all versions actually support __int128.
+#ifdef ABSL_HAVE_INTRINSIC_INT128
+#error ABSL_HAVE_INTRINSIC_INT128 cannot be directly set
+#elif (defined(__clang__) && defined(__SIZEOF_INT128__) &&               \
+       !defined(__ppc64__) && !defined(__aarch64__)) ||                  \
+    (defined(__CUDACC__) && defined(__SIZEOF_INT128__) &&                \
+     __CUDACC_VER__ >= 70000) ||                                         \
+    (!defined(__clang__) && !defined(__CUDACC__) && defined(__GNUC__) && \
+     defined(__SIZEOF_INT128__))
+#define ABSL_HAVE_INTRINSIC_INT128 1
 #endif
 
-template <typename UInt>
-inline bitcount_t clog2(UInt v)
-{
-    return flog2(v) + ((v & (-v)) != v);
-}
+// -----------------------------------------------------------------------------
+// (File: int128.h)
+// -----------------------------------------------------------------------------
+//
+// This header file defines 128-bit integer types. Currently, this file defines
+// `uint128`, an unsigned 128-bit integer; a signed 128-bit integer is
+// forthcoming.
 
-template <typename UInt>
-inline UInt addwithcarry(UInt x, UInt y, bool carryin, bool* carryout)
-{
-    UInt half_result = y + carryin;
-    UInt result = x + half_result;
-    *carryout = (half_result < y) || (result < x);
-    return result;
-}
+// uint128
+//
+// An unsigned 128-bit integer type. The API is meant to mimic an intrinsic type
+// as closely as is practical, including exhibiting undefined behavior in
+// analogous cases (e.g. division by zero). This type is intended to be a
+// drop-in replacement once C++ supports an intrinsic `uint128_t` type; when
+// that occurs, existing uses of `uint128` will continue to work using that new
+// type.
+//
+// Note: code written with this type will continue to compile once `unint128_t`
+// is introduced, provided the replacement helper functions
+// `Uint128(Low|High)64()` and `MakeUint128()` are made.
+//
+// A `uint128` supports the following:
+//
+//   * Implicit construction from integral types
+//   * Explicit conversion to integral types
+//
+// Additionally, if your compiler supports `__int128`, `uint128` is
+// interoperable with that type. (Abseil checks for this compatibility through
+// the `ABSL_HAVE_INTRINSIC_INT128` macro.)
+//
+// However, a `uint128` differs from intrinsic integral types in the following
+// ways:
+//
+//   * Errors on implicit conversions that does not preserve value (such as
+//     loss of precision when converting to float values).
+//   * Requires explicit construction from and conversion to floating point
+//     types.
+//   * Conversion to integral types requires an explicit static_cast() to
+//     mimic use of the `-Wnarrowing` compiler flag.
+//
+// Example:
+//
+//     float y = kuint128max; // Error. uint128 cannot be implicitly converted
+//                            // to float.
+//
+//     uint128 v;
+//     uint64_t i = v                          // Error
+//     uint64_t i = static_cast<uint64_t>(v)   // OK
+//
+class alignas(16) uint128 {
+ public:
+  constexpr uint128() : lo_(0), hi_(0) {};
 
-template <typename UInt>
-inline UInt subwithcarry(UInt x, UInt y, bool carryin, bool* carryout)
-{
-    UInt half_result = y + carryin;
-    UInt result = x - half_result;
-    *carryout = (half_result < y) || (result > x);
-    return result;
-}
+  // Constructors from arithmetic types
+  constexpr uint128(int v);                 // NOLINT(runtime/explicit)
+  constexpr uint128(unsigned int v);        // NOLINT(runtime/explicit)
+  constexpr uint128(long v);                // NOLINT(runtime/int)
+  constexpr uint128(unsigned long v);       // NOLINT(runtime/int)
+  constexpr uint128(long long v);           // NOLINT(runtime/int)
+  constexpr uint128(unsigned long long v);  // NOLINT(runtime/int)
+#ifdef ABSL_HAVE_INTRINSIC_INT128
+  constexpr uint128(__int128 v);           // NOLINT(runtime/explicit)
+  constexpr uint128(unsigned __int128 v);  // NOLINT(runtime/explicit)
+#endif  // ABSL_HAVE_INTRINSIC_INT128
+  explicit uint128(float v);        // NOLINT(runtime/explicit)
+  explicit uint128(double v);       // NOLINT(runtime/explicit)
+  explicit uint128(long double v);  // NOLINT(runtime/explicit)
 
+  // Assignment operators from arithmetic types
+  constexpr uint128& operator=(int v);
+  constexpr uint128& operator=(unsigned int v);
+  constexpr uint128& operator=(long v);                // NOLINT(runtime/int)
+  constexpr uint128& operator=(unsigned long v);       // NOLINT(runtime/int)
+  constexpr uint128& operator=(long long v);           // NOLINT(runtime/int)
+  constexpr uint128& operator=(unsigned long long v);  // NOLINT(runtime/int)
+#ifdef ABSL_HAVE_INTRINSIC_INT128
+  constexpr uint128& operator=(__int128 v);
+  constexpr uint128& operator=(unsigned __int128 v);
+#endif  // ABSL_HAVE_INTRINSIC_INT128
 
-template <typename UInt, typename UIntX2>
-class uint_x4 {
-// private:
-public:
-    union {
-#if PCG_LITTLE_ENDIAN
-        struct {
-            UInt v0, v1, v2, v3;
-        } w;
-        struct {
-            UIntX2 v01, v23;
-        } d;
-#else
-        struct {
-            UInt v3, v2, v1, v0;
-        } w;
-        struct {
-            UIntX2 v23, v01;
-        } d;
-#endif
-        // For the array access versions, the code that uses the array
-        // must handle endian itself.  Yuck.
-        UInt wa[4];
-        UIntX2 da[2];
-    };
+  // Conversion operators to other arithmetic types
+  constexpr explicit operator bool() const;
+  constexpr explicit operator char() const;
+  constexpr explicit operator signed char() const;
+  constexpr explicit operator unsigned char() const;
+  constexpr explicit operator char16_t() const;
+  constexpr explicit operator char32_t() const;
+  constexpr explicit operator wchar_t() const;
+  constexpr explicit operator short() const;  // NOLINT(runtime/int)
+  // NOLINTNEXTLINE(runtime/int)
+  constexpr explicit operator unsigned short() const;
+  constexpr explicit operator int() const;
+  constexpr explicit operator unsigned int() const;
+  constexpr explicit operator long() const;  // NOLINT(runtime/int)
+  // NOLINTNEXTLINE(runtime/int)
+  constexpr explicit operator unsigned long() const;
+  // NOLINTNEXTLINE(runtime/int)
+  constexpr explicit operator long long() const;
+  // NOLINTNEXTLINE(runtime/int)
+  constexpr explicit operator unsigned long long() const;
+#ifdef ABSL_HAVE_INTRINSIC_INT128
+  constexpr explicit operator __int128() const;
+  constexpr explicit operator unsigned __int128() const;
+#endif  // ABSL_HAVE_INTRINSIC_INT128
+  explicit operator float() const;
+  explicit operator double() const;
+  explicit operator long double() const;
 
-public:
-    uint_x4() = default;
+  // Trivial copy constructor, assignment operator and destructor.
 
-    constexpr uint_x4(UInt v3, UInt v2, UInt v1, UInt v0)
-#if PCG_LITTLE_ENDIAN
-       : w{v0, v1, v2, v3}
-#else
-       : w{v3, v2, v1, v0}
-#endif
-    {
-        // Nothing (else) to do
-    }
+  // Arithmetic operators.
+  constexpr uint128& operator+=(const uint128& other);
+  constexpr uint128& operator-=(const uint128& other);
+  constexpr uint128& operator*=(const uint128& other);
+  // Long division/modulo for uint128.
+  constexpr uint128& operator/=(const uint128& other);
+  constexpr uint128& operator%=(const uint128& other);
+  constexpr uint128 operator++(int);
+  constexpr uint128 operator--(int);
+  constexpr uint128& operator<<=(int);
+  constexpr uint128& operator>>=(int);
+  constexpr uint128& operator&=(const uint128& other);
+  constexpr uint128& operator|=(const uint128& other);
+  constexpr uint128& operator^=(const uint128& other);
+  constexpr uint128& operator++();
+  constexpr uint128& operator--();
 
-    constexpr uint_x4(UIntX2 v23, UIntX2 v01)
-#if PCG_LITTLE_ENDIAN
-       : d{v01,v23}
-#else
-       : d{v23,v01}
-#endif
-    {
-        // Nothing (else) to do
-    }
+  // Uint128Low64()
+  //
+  // Returns the lower 64-bit value of a `uint128` value.
+  friend inline constexpr uint64_t Uint128Low64(const uint128& v);
 
-    template<class Integral,
-             typename std::enable_if<(std::is_integral<Integral>::value
-                                      && sizeof(Integral) <= sizeof(UIntX2))
-                                    >::type* = nullptr>
-    constexpr uint_x4(Integral v01)
-#if PCG_LITTLE_ENDIAN
-       : d{UIntX2(v01),0UL}
-#else
-       : d{0UL,UIntX2(v01)}
-#endif
-    {
-        // Nothing (else) to do
-    }
+  // Uint128High64()
+  //
+  // Returns the higher 64-bit value of a `uint128` value.
+  friend inline constexpr uint64_t Uint128High64(const uint128& v);
 
-    explicit constexpr operator uint64_t() const
-    {
-        return d.v01;
-    }
+  // MakeUInt128()
+  //
+  // Constructs a `uint128` numeric value from two 64-bit unsigned integers.
+  // Note that this factory function is the only way to construct a `uint128`
+  // from integer values greater than 2^64.
+  //
+  // Example:
+  //
+  //   absl::uint128 big = absl::MakeUint128(1, 0);
+  friend inline constexpr uint128 MakeUint128(const uint64_t& top,const uint64_t& bottom);
+  inline constexpr uint128(uint64_t top, uint64_t bottom) : hi_(top), lo_(bottom) {};
 
-    explicit constexpr operator uint32_t() const
-    {
-        return w.v0;
-    }
-
-    explicit constexpr operator int() const
-    {
-        return w.v0;
-    }
-
-    explicit constexpr operator uint16_t() const
-    {
-        return w.v0;
-    }
-
-    explicit constexpr operator uint8_t() const
-    {
-        return w.v0;
-    }
-
-    typedef typename std::conditional<std::is_same<uint64_t,
-                                                   unsigned long>::value,
-                                      unsigned long long,
-                                      unsigned long>::type
-            uint_missing_t;
-
-    explicit constexpr operator uint_missing_t() const
-    {
-        return d.v01;
-    }
-
-    explicit constexpr operator bool() const
-    {
-        return d.v01 || d.v23;
-    }
-
-    template<typename U, typename V>
-    friend uint_x4<U,V> operator*(const uint_x4<U,V>&, const uint_x4<U,V>&);
-
-    template<typename U, typename V>
-    friend std::pair< uint_x4<U,V>,uint_x4<U,V> >
-        divmod(const uint_x4<U,V>&, const uint_x4<U,V>&);
-
-    template<typename U, typename V>
-    friend uint_x4<U,V> operator+(const uint_x4<U,V>&, const uint_x4<U,V>&);
-
-    template<typename U, typename V>
-    friend uint_x4<U,V> operator-(const uint_x4<U,V>&, const uint_x4<U,V>&);
-
-    template<typename U, typename V>
-    friend uint_x4<U,V> operator<<(const uint_x4<U,V>&, const uint_x4<U,V>&);
-
-    template<typename U, typename V>
-    friend uint_x4<U,V> operator>>(const uint_x4<U,V>&, const uint_x4<U,V>&);
-
-    template<typename U, typename V>
-    friend uint_x4<U,V> operator&(const uint_x4<U,V>&, const uint_x4<U,V>&);
-
-    template<typename U, typename V>
-    friend uint_x4<U,V> operator|(const uint_x4<U,V>&, const uint_x4<U,V>&);
-
-    template<typename U, typename V>
-    friend uint_x4<U,V> operator^(const uint_x4<U,V>&, const uint_x4<U,V>&);
-
-    template<typename U, typename V>
-    friend bool operator==(const uint_x4<U,V>&, const uint_x4<U,V>&);
-
-    template<typename U, typename V>
-    friend bool operator!=(const uint_x4<U,V>&, const uint_x4<U,V>&);
-
-    template<typename U, typename V>
-    friend bool operator<(const uint_x4<U,V>&, const uint_x4<U,V>&);
-
-    template<typename U, typename V>
-    friend bool operator<=(const uint_x4<U,V>&, const uint_x4<U,V>&);
-
-    template<typename U, typename V>
-    friend bool operator>(const uint_x4<U,V>&, const uint_x4<U,V>&);
-
-    template<typename U, typename V>
-    friend bool operator>=(const uint_x4<U,V>&, const uint_x4<U,V>&);
-
-    template<typename U, typename V>
-    friend uint_x4<U,V> operator~(const uint_x4<U,V>&);
-
-    template<typename U, typename V>
-    friend uint_x4<U,V> operator-(const uint_x4<U,V>&);
-
-    template<typename U, typename V>
-    friend bitcount_t flog2(const uint_x4<U,V>&);
-
-    template<typename U, typename V>
-    friend bitcount_t trailingzeros(const uint_x4<U,V>&);
-
-    uint_x4& operator*=(const uint_x4& rhs)
-    {
-        uint_x4 result = *this * rhs;
-        return *this = result;
-    }
-
-    uint_x4& operator/=(const uint_x4& rhs)
-    {
-        uint_x4 result = *this / rhs;
-        return *this = result;
-    }
-
-    uint_x4& operator%=(const uint_x4& rhs)
-    {
-        uint_x4 result = *this % rhs;
-        return *this = result;
-    }
-
-    uint_x4& operator+=(const uint_x4& rhs)
-    {
-        uint_x4 result = *this + rhs;
-        return *this = result;
-    }
-
-    uint_x4& operator-=(const uint_x4& rhs)
-    {
-        uint_x4 result = *this - rhs;
-        return *this = result;
-    }
-
-    uint_x4& operator&=(const uint_x4& rhs)
-    {
-        uint_x4 result = *this & rhs;
-        return *this = result;
-    }
-
-    uint_x4& operator|=(const uint_x4& rhs)
-    {
-        uint_x4 result = *this | rhs;
-        return *this = result;
-    }
-
-    uint_x4& operator^=(const uint_x4& rhs)
-    {
-        uint_x4 result = *this ^ rhs;
-        return *this = result;
-    }
-
-    uint_x4& operator>>=(bitcount_t shift)
-    {
-        uint_x4 result = *this >> shift;
-        return *this = result;
-    }
-
-    uint_x4& operator<<=(bitcount_t shift)
-    {
-        uint_x4 result = *this << shift;
-        return *this = result;
-    }
-
+  private:
+  // TODO(strel) Update implementation to use __int128 once all users of
+  // uint128 are fixed to not depend on alignof(uint128) == 8. Also add
+  // alignas(16) to class definition to keep alignment consistent across
+  // platforms.
+#if defined(ABSL_IS_LITTLE_ENDIAN)
+  uint64_t lo_;
+  uint64_t hi_;
+#elif defined(ABSL_IS_BIG_ENDIAN)
+  uint64_t hi_;
+  uint64_t lo_;
+#else  // byte order
+#error "Unsupported byte order: must be little-endian or big-endian."
+#endif  // byte order
 };
 
-template<typename U, typename V>
-bitcount_t flog2(const uint_x4<U,V>& v)
-{
-#if PCG_LITTLE_ENDIAN
-    for (uint8_t i = 4; i !=0; /* dec in loop */) {
-        --i;
-#else
-    for (uint8_t i = 0; i < 4; ++i) {
-#endif
-        if (v.wa[i] == 0)
-             continue;
-        return flog2(v.wa[i]) + (sizeof(U)*CHAR_BIT)*i;
+
+
+// allow uint128 to be logged
+//extern std::ostream& operator<<(std::ostream& o, const uint128& b);
+
+// TODO(strel) add operator>>(std::istream&, uint128&)
+
+// Methods to access low and high pieces of 128-bit value.
+inline constexpr uint64_t Uint128Low64(const uint128& v);
+inline constexpr uint64_t Uint128High64(const uint128& v);
+
+// TODO(absl-team): Implement signed 128-bit type
+
+// --------------------------------------------------------------------------
+//                      Implementation details follow
+// --------------------------------------------------------------------------
+
+
+inline constexpr uint128 MakeUint128(const uint64_t& top,const uint64_t& bottom) {
+	return uint128(top, bottom);
+}
+
+static constexpr const auto kuint128max = MakeUint128(std::numeric_limits<uint64_t>::max(), std::numeric_limits<uint64_t>::max());
+
+// Assignment from integer types.
+
+inline constexpr uint128& uint128::operator=(int v) {
+  return *this = uint128(v);
+}
+
+inline constexpr uint128& uint128::operator=(unsigned int v) {
+  return *this = uint128(v);
+}
+
+inline constexpr uint128& uint128::operator=(long v) {  // NOLINT(runtime/int)
+  return *this = uint128(v);
+}
+
+// NOLINTNEXTLINE(runtime/int)
+inline constexpr uint128& uint128::operator=(unsigned long v) {
+  return *this = uint128(v);
+}
+
+// NOLINTNEXTLINE(runtime/int)
+inline constexpr uint128& uint128::operator=(long long v) {
+  return *this = uint128(v);
+}
+
+// NOLINTNEXTLINE(runtime/int)
+inline constexpr uint128& uint128::operator=(unsigned long long v) {
+  return *this = uint128(v);
+}
+
+#ifdef ABSL_HAVE_INTRINSIC_INT128
+inline constexpr uint128& uint128::operator=(__int128 v) {
+  return *this = uint128(v);
+}
+
+inline constexpr uint128& uint128::operator=(unsigned __int128 v) {
+  return *this = uint128(v);
+}
+#endif  // ABSL_HAVE_INTRINSIC_INT128
+
+// Shift and arithmetic operators.
+
+inline constexpr uint128 operator<<(const uint128& lhs, int amount) {
+  return uint128(lhs) <<= amount;
+}
+
+inline constexpr uint128 operator>>(const uint128& lhs, int amount) {
+  return uint128(lhs) >>= amount;
+}
+
+inline constexpr uint128 operator+(const uint128& lhs, const uint128& rhs) {
+  return uint128(lhs) += rhs;
+}
+
+inline constexpr uint128 operator-(const uint128& lhs, const uint128& rhs) {
+  return uint128(lhs) -= rhs;
+}
+
+inline constexpr uint128 operator*(const uint128& lhs, const uint128& rhs) {
+  return uint128(lhs) *= rhs;
+}
+
+inline constexpr uint128 operator/(const uint128& lhs, const uint128& rhs) {
+  return uint128(lhs) /= rhs;
+}
+
+inline constexpr uint128 operator%(const uint128& lhs, const uint128& rhs) {
+  return uint128(lhs) %= rhs;
+}
+
+inline constexpr uint64_t Uint128Low64(const uint128& v) { return v.lo_; }
+
+inline constexpr uint64_t Uint128High64(const uint128& v) { return v.hi_; }
+
+// Constructors from integer types.
+
+#if defined(ABSL_IS_LITTLE_ENDIAN)
+
+//inline constexpr uint128::uint128(uint64_t top, uint64_t bottom)
+//    : lo_(bottom), hi_(top) {}
+
+inline constexpr uint128::uint128(int v)
+    : lo_(v), hi_(v < 0 ? std::numeric_limits<uint64_t>::max() : 0) {}
+inline constexpr uint128::uint128(long v)  // NOLINT(runtime/int)
+    : lo_(v), hi_(v < 0 ? std::numeric_limits<uint64_t>::max() : 0) {}
+inline constexpr uint128::uint128(long long v)  // NOLINT(runtime/int)
+    : lo_(v), hi_(v < 0 ? std::numeric_limits<uint64_t>::max() : 0) {}
+
+inline constexpr uint128::uint128(unsigned int v) : lo_(v), hi_(0) {}
+// NOLINTNEXTLINE(runtime/int)
+inline constexpr uint128::uint128(unsigned long v) : lo_(v), hi_(0) {}
+// NOLINTNEXTLINE(runtime/int)
+inline constexpr uint128::uint128(unsigned long long v)
+    : lo_(v), hi_(0) {}
+
+#ifdef ABSL_HAVE_INTRINSIC_INT128
+inline constexpr uint128::uint128(__int128 v)
+    : lo_(static_cast<uint64_t>(v & ~uint64_t{0})),
+      hi_(static_cast<uint64_t>(static_cast<unsigned __int128>(v) >> 64)) {}
+inline constexpr uint128::uint128(unsigned __int128 v)
+    : lo_(static_cast<uint64_t>(v & ~uint64_t{0})),
+      hi_(static_cast<uint64_t>(v >> 64)) {}
+#endif  // ABSL_HAVE_INTRINSIC_INT128
+
+#elif defined(ABSL_IS_BIG_ENDIAN)
+
+inline constexpr uint128::uint128(uint64_t top, uint64_t bottom)
+    : hi_(top), lo_(bottom) {}
+
+inline constexpr uint128::uint128(int v)
+    : hi_(v < 0 ? std::numeric_limits<uint64_t>::max() : 0), lo_(v) {}
+inline constexpr uint128::uint128(long v)  // NOLINT(runtime/int)
+    : hi_(v < 0 ? std::numeric_limits<uint64_t>::max() : 0), lo_(v) {}
+inline constexpr uint128::uint128(long long v)  // NOLINT(runtime/int)
+    : hi_(v < 0 ? std::numeric_limits<uint64_t>::max() : 0), lo_(v) {}
+
+inline constexpr uint128::uint128(unsigned int v) : hi_(0), lo_(v) {}
+// NOLINTNEXTLINE(runtime/int)
+inline constexpr uint128::uint128(unsigned long v) : hi_(0), lo_(v) {}
+// NOLINTNEXTLINE(runtime/int)
+inline constexpr uint128::uint128(unsigned long long v)
+    : hi_(0), lo_(v) {}
+
+#ifdef ABSL_HAVE_INTRINSIC_INT128
+inline constexpr uint128::uint128(__int128 v)
+    : hi_(static_cast<uint64_t>(static_cast<unsigned __int128>(v) >> 64)),
+      lo_(static_cast<uint64_t>(v & ~uint64_t{0})) {}
+inline constexpr uint128::uint128(unsigned __int128 v)
+    : hi_(static_cast<uint64_t>(v >> 64)),
+      lo_(static_cast<uint64_t>(v & ~uint64_t{0})) {}
+#endif  // ABSL_HAVE_INTRINSIC_INT128
+
+#else  // byte order
+#error "Unsupported byte order: must be little-endian or big-endian."
+#endif  // byte order
+
+// Conversion operators to integer types.
+
+inline constexpr uint128::operator bool() const {
+  return lo_ || hi_;
+}
+
+inline constexpr uint128::operator char() const {
+  return static_cast<char>(lo_);
+}
+
+inline constexpr uint128::operator signed char() const {
+  return static_cast<signed char>(lo_);
+}
+
+inline constexpr uint128::operator unsigned char() const {
+  return static_cast<unsigned char>(lo_);
+}
+
+inline constexpr uint128::operator char16_t() const {
+  return static_cast<char16_t>(lo_);
+}
+
+inline constexpr uint128::operator char32_t() const {
+  return static_cast<char32_t>(lo_);
+}
+
+inline constexpr uint128::operator wchar_t() const {
+  return static_cast<wchar_t>(lo_);
+}
+
+// NOLINTNEXTLINE(runtime/int)
+inline constexpr uint128::operator short() const {
+  return static_cast<short>(lo_);  // NOLINT(runtime/int)
+}
+
+// NOLINTNEXTLINE(runtime/int)
+inline constexpr uint128::operator unsigned short() const {
+  return static_cast<unsigned short>(lo_);  // NOLINT(runtime/int)
+}
+
+inline constexpr uint128::operator int() const {
+  return static_cast<int>(lo_);
+}
+
+inline constexpr uint128::operator unsigned int() const {
+  return static_cast<unsigned int>(lo_);
+}
+
+// NOLINTNEXTLINE(runtime/int)
+inline constexpr uint128::operator long() const {
+  return static_cast<long>(lo_);  // NOLINT(runtime/int)
+}
+
+// NOLINTNEXTLINE(runtime/int)
+inline constexpr uint128::operator unsigned long() const {
+  return static_cast<unsigned long>(lo_);  // NOLINT(runtime/int)
+}
+
+// NOLINTNEXTLINE(runtime/int)
+inline constexpr uint128::operator long long() const {
+  return static_cast<long long>(lo_);  // NOLINT(runtime/int)
+}
+
+// NOLINTNEXTLINE(runtime/int)
+inline constexpr uint128::operator unsigned long long() const {
+  return static_cast<unsigned long long>(lo_);  // NOLINT(runtime/int)
+}
+
+#ifdef ABSL_HAVE_INTRINSIC_INT128
+inline constexpr uint128::operator __int128() const {
+  return (static_cast<__int128>(hi_) << 64) + lo_;
+}
+
+inline constexpr uint128::operator unsigned __int128() const {
+  return (static_cast<unsigned __int128>(hi_) << 64) + lo_;
+}
+#endif  // ABSL_HAVE_INTRINSIC_INT128
+
+// Conversion operators to floating point types.
+
+inline uint128::operator float() const {
+  return static_cast<float>(lo_) + std::ldexp(static_cast<float>(hi_), 64);
+}
+
+inline uint128::operator double() const {
+  return static_cast<double>(lo_) + std::ldexp(static_cast<double>(hi_), 64);
+}
+
+inline uint128::operator long double() const {
+  return static_cast<long double>(lo_) +
+         std::ldexp(static_cast<long double>(hi_), 64);
+}
+
+// Comparison operators.
+
+inline constexpr bool operator==(const uint128& lhs, const uint128& rhs) {
+  return (Uint128Low64(lhs) == Uint128Low64(rhs) &&
+          Uint128High64(lhs) == Uint128High64(rhs));
+}
+
+inline constexpr bool operator!=(const uint128& lhs, const uint128& rhs) {
+  return !(lhs == rhs);
+}
+
+inline constexpr bool operator<(const uint128& lhs, const uint128& rhs) {
+  return (Uint128High64(lhs) == Uint128High64(rhs))
+             ? (Uint128Low64(lhs) < Uint128Low64(rhs))
+             : (Uint128High64(lhs) < Uint128High64(rhs));
+}
+
+inline constexpr bool operator>(const uint128& lhs, const uint128& rhs) {
+  return (Uint128High64(lhs) == Uint128High64(rhs))
+             ? (Uint128Low64(lhs) > Uint128Low64(rhs))
+             : (Uint128High64(lhs) > Uint128High64(rhs));
+}
+
+inline constexpr bool operator<=(const uint128& lhs, const uint128& rhs) {
+  return (Uint128High64(lhs) == Uint128High64(rhs))
+             ? (Uint128Low64(lhs) <= Uint128Low64(rhs))
+             : (Uint128High64(lhs) <= Uint128High64(rhs));
+}
+
+inline constexpr bool operator>=(const uint128& lhs, const uint128& rhs) {
+  return (Uint128High64(lhs) == Uint128High64(rhs))
+             ? (Uint128Low64(lhs) >= Uint128Low64(rhs))
+             : (Uint128High64(lhs) >= Uint128High64(rhs));
+}
+
+// Unary operators.
+
+inline constexpr uint128 operator-(const uint128& val) {
+  const uint64_t hi_flip = ~Uint128High64(val);
+  const uint64_t lo_flip = ~Uint128Low64(val);
+  const uint64_t lo_add = lo_flip + 1;
+  if (lo_add < lo_flip) {
+    return MakeUint128(hi_flip + 1, lo_add);
+  }
+  return MakeUint128(hi_flip, lo_add);
+}
+
+inline constexpr bool operator!(const uint128& val) {
+  return !Uint128High64(val) && !Uint128Low64(val);
+}
+
+// Logical operators.
+
+inline constexpr uint128 operator~(const uint128& val) {
+  return MakeUint128(~Uint128High64(val), ~Uint128Low64(val));
+}
+
+inline constexpr uint128 operator|(const uint128& lhs, const uint128& rhs) {
+  return MakeUint128(Uint128High64(lhs) | Uint128High64(rhs),
+                           Uint128Low64(lhs) | Uint128Low64(rhs));
+}
+
+inline constexpr uint128 operator&(const uint128& lhs, const uint128& rhs) {
+  return MakeUint128(Uint128High64(lhs) & Uint128High64(rhs),
+                           Uint128Low64(lhs) & Uint128Low64(rhs));
+}
+
+inline constexpr uint128 operator^(const uint128& lhs, const uint128& rhs) {
+  return MakeUint128(Uint128High64(lhs) ^ Uint128High64(rhs),
+                           Uint128Low64(lhs) ^ Uint128Low64(rhs));
+}
+
+inline constexpr uint128& uint128::operator|=(const uint128& other) {
+  hi_ |= other.hi_;
+  lo_ |= other.lo_;
+  return *this;
+}
+
+inline constexpr uint128& uint128::operator&=(const uint128& other) {
+  hi_ &= other.hi_;
+  lo_ &= other.lo_;
+  return *this;
+}
+
+inline constexpr uint128& uint128::operator^=(const uint128& other) {
+  hi_ ^= other.hi_;
+  lo_ ^= other.lo_;
+  return *this;
+}
+
+// Shift and arithmetic assign operators.
+
+inline constexpr uint128& uint128::operator<<=(int amount) {
+  // Shifts of >= 128 are undefined.
+  assert(amount < 128);
+
+  // uint64_t shifts of >= 64 are undefined, so we will need some
+  // special-casing.
+  if (amount < 64) {
+    if (amount != 0) {
+      hi_ = (hi_ << amount) | (lo_ >> (64 - amount));
+      lo_ = lo_ << amount;
     }
-    abort();
+  } else {
+    hi_ = lo_ << (amount - 64);
+    lo_ = 0;
+  }
+  return *this;
 }
 
-template<typename U, typename V>
-bitcount_t trailingzeros(const uint_x4<U,V>& v)
-{
-#if PCG_LITTLE_ENDIAN
-    for (uint8_t i = 0; i < 4; ++i) {
-#else
-    for (uint8_t i = 4; i !=0; /* dec in loop */) {
-        --i;
-#endif
-        if (v.wa[i] != 0)
-            return trailingzeros(v.wa[i]) + (sizeof(U)*CHAR_BIT)*i;
+inline constexpr uint128& uint128::operator>>=(int amount) {
+  // Shifts of >= 128 are undefined.
+  assert(amount < 128);
+
+  // uint64_t shifts of >= 64 are undefined, so we will need some
+  // special-casing.
+  if (amount < 64) {
+    if (amount != 0) {
+      lo_ = (lo_ >> amount) | (hi_ << (64 - amount));
+      hi_ = hi_ >> amount;
     }
-    return (sizeof(U)*CHAR_BIT)*4;
+  } else {
+    lo_ = hi_ >> (amount - 64);
+    hi_ = 0;
+  }
+  return *this;
 }
 
-template <typename UInt, typename UIntX2>
-std::pair< uint_x4<UInt,UIntX2>, uint_x4<UInt,UIntX2> >
-    divmod(const uint_x4<UInt,UIntX2>& orig_dividend,
-           const uint_x4<UInt,UIntX2>& divisor)
-{
-    // If the dividend is less than the divisor, the answer is always zero.
-    // This takes care of boundary cases like 0/x (which would otherwise be
-    // problematic because we can't take the log of zero.  (The boundary case
-    // of division by zero is undefined.)
-    if (orig_dividend < divisor)
-        return { uint_x4<UInt,UIntX2>(0UL), orig_dividend };
-
-    auto dividend = orig_dividend;
-
-    auto log2_divisor  = flog2(divisor);
-    auto log2_dividend = flog2(dividend);
-    // assert(log2_dividend >= log2_divisor);
-    bitcount_t logdiff = log2_dividend - log2_divisor;
-
-    constexpr uint_x4<UInt,UIntX2> ONE(1UL);
-    if (logdiff == 0)
-        return { ONE, dividend - divisor };
-
-    // Now we change the log difference to
-    //  floor(log2(divisor)) - ceil(log2(dividend))
-    // to ensure that we *underestimate* the result.
-    logdiff -= 1;
-
-    uint_x4<UInt,UIntX2> quotient(0UL);
-
-    auto qfactor = ONE << logdiff;
-    auto factor  = divisor << logdiff;
-
-    do {
-        dividend -= factor;
-        quotient += qfactor;
-        while (dividend < factor) {
-            factor  >>= 1;
-            qfactor >>= 1;
-        }
-    } while (dividend >= divisor);
-
-    return { quotient, dividend };
+inline constexpr uint128& uint128::operator+=(const uint128& other) {
+  hi_ += other.hi_;
+  uint64_t lolo = lo_ + other.lo_;
+  if (lolo < lo_)
+    ++hi_;
+  lo_ = lolo;
+  return *this;
 }
 
-template <typename UInt, typename UIntX2>
-uint_x4<UInt,UIntX2> operator/(const uint_x4<UInt,UIntX2>& dividend,
-                               const uint_x4<UInt,UIntX2>& divisor)
-{
-    return divmod(dividend, divisor).first;
+inline constexpr uint128& uint128::operator-=(const uint128& other) {
+  hi_ -= other.hi_;
+  if (other.lo_ > lo_) --hi_;
+  lo_ -= other.lo_;
+  return *this;
 }
 
-template <typename UInt, typename UIntX2>
-uint_x4<UInt,UIntX2> operator%(const uint_x4<UInt,UIntX2>& dividend,
-                               const uint_x4<UInt,UIntX2>& divisor)
-{
-    return divmod(dividend, divisor).second;
+inline constexpr uint128& uint128::operator*=(const uint128& other) {
+#if defined(ABSL_HAVE_INTRINSIC_INT128)
+  // TODO(strel) Remove once alignment issues are resolved and unsigned __int128
+  // can be used for uint128 storage.
+  *this = static_cast<unsigned __int128>(*this) *
+          static_cast<unsigned __int128>(other);
+  return *this;
+#else   // ABSL_HAVE_INTRINSIC128
+  uint64_t a96 = hi_ >> 32;
+  uint64_t a64 = hi_ & 0xffffffff;
+  uint64_t a32 = lo_ >> 32;
+  uint64_t a00 = lo_ & 0xffffffff;
+  uint64_t b96 = other.hi_ >> 32;
+  uint64_t b64 = other.hi_ & 0xffffffff;
+  uint64_t b32 = other.lo_ >> 32;
+  uint64_t b00 = other.lo_ & 0xffffffff;
+  // multiply [a96 .. a00] x [b96 .. b00]
+  // terms higher than c96 disappear off the high side
+  // terms c96 and c64 are safe to ignore carry bit
+  uint64_t c96 = a96 * b00 + a64 * b32 + a32 * b64 + a00 * b96;
+  uint64_t c64 = a64 * b00 + a32 * b32 + a00 * b64;
+  this->hi_ = (c96 << 32) + c64;
+  this->lo_ = 0;
+  // add terms after this one at a time to capture carry
+  *this += uint128(a32 * b00) << 32;
+  *this += uint128(a00 * b32) << 32;
+  *this += a00 * b00;
+  return *this;
+#endif  // ABSL_HAVE_INTRINSIC128
+}
+
+// Increment/decrement operators.
+
+inline constexpr uint128 uint128::operator++(int) {
+  uint128 tmp(*this);
+  *this += 1;
+  return tmp;
+}
+
+inline constexpr uint128 uint128::operator--(int) {
+  uint128 tmp(*this);
+  *this -= 1;
+  return tmp;
+}
+
+inline constexpr uint128& uint128::operator++() {
+  *this += 1;
+  return *this;
+}
+
+inline constexpr uint128& uint128::operator--() {
+  *this -= 1;
+  return *this;
+}
+
+namespace {
+
+	// Returns the 0-based position of the last set bit (i.e., most significant bit)
+	// in the given uint64_t. The argument may not be 0.
+	//
+	// For example:
+	//   Given: 5 (decimal) == 101 (binary)
+	//   Returns: 2
+#define STEP(T, n, pos, sh)                   \
+  do {                                        \
+    if ((n) >= (static_cast<T>(1) << (sh))) { \
+      (n) = (n) >> (sh);                      \
+      (pos) |= (sh);                          \
+    }                                         \
+  } while (0)
+	static constexpr inline int Fls64(uint64_t n) {
+		assert(n != 0);
+		int pos = 0;
+		STEP(uint64_t, n, pos, 0x20);
+		uint32_t n32 = static_cast<uint32_t>(n);
+		STEP(uint32_t, n32, pos, 0x10);
+		STEP(uint32_t, n32, pos, 0x08);
+		STEP(uint32_t, n32, pos, 0x04);
+		return pos + ((uint64_t{ 0x3333333322221100 } >> (n32 << 2)) & 0x3);
+	}
+#undef STEP
+
+	// Like Fls64() above, but returns the 0-based position of the last set bit
+	// (i.e., most significant bit) in the given uint128. The argument may not be 0.
+	static constexpr inline int Fls128(uint128 n) {
+		if (uint64_t hi = Uint128High64(n)) {
+			return Fls64(hi) + 64;
+		}
+		return Fls64(Uint128Low64(n));
+	}
+
+	// Long division/modulo for uint128 implemented using the shift-subtract
+	// division algorithm adapted from:
+	// http://stackoverflow.com/questions/5386377/division-without-using
+	inline constexpr void DivModImpl(uint128 dividend, uint128 divisor, uint128* quotient_ret,
+		uint128* remainder_ret) {
+		assert(divisor != 0);
+
+		if (divisor > dividend) {
+			*quotient_ret = 0;
+			*remainder_ret = dividend;
+			return;
+		}
+
+		if (divisor == dividend) {
+			*quotient_ret = 1;
+			*remainder_ret = 0;
+			return;
+		}
+
+		uint128 denominator = divisor;
+		uint128 quotient = 0;
+
+		// Left aligns the MSB of the denominator and the dividend.
+		const int shift = Fls128(dividend) - Fls128(denominator);
+		denominator <<= shift;
+
+		// Uses shift-subtract algorithm to divide dividend by denominator. The
+		// remainder will be left in dividend.
+		for (int i = 0; i <= shift; ++i) {
+			quotient <<= 1;
+			if (dividend >= denominator) {
+				dividend -= denominator;
+				quotient |= 1;
+			}
+			denominator >>= 1;
+		}
+
+		*quotient_ret = quotient;
+		*remainder_ret = dividend;
+	}
+
+	template <typename T>
+	inline std::enable_if_t<std::is_floating_point_v<T>,uint128> Initialize128FromFloat(T v) {
+		// Rounding behavior is towards zero, same as for built-in types.
+
+		// Undefined behavior if v is NaN or cannot fit into uint128.
+		assert(!std::isnan(v) && v > -1 && v < std::ldexp(static_cast<T>(1), 128));
+
+		if (v >= std::ldexp(static_cast<T>(1), 64)) {
+			uint64_t hi = static_cast<uint64_t>(std::ldexp(v, -64));
+			uint64_t lo = static_cast<uint64_t>(v - std::ldexp(static_cast<T>(hi), 64));
+			return MakeUint128(hi, lo);
+		}
+
+		return MakeUint128(0, static_cast<uint64_t>(v));
+	}
+}  // namespace
+//
+//uint128::uint128(float v) : uint128(Initialize128FromFloat(v)) {}
+//uint128::uint128(double v) : uint128(Initialize128FromFloat(v)) {}
+//uint128::uint128(long double v) : uint128(Initialize128FromFloat(v)) {}
+
+inline constexpr uint128& uint128::operator/=(const uint128& divisor) {
+	uint128 quotient = 0;
+	uint128 remainder = 0;
+	DivModImpl(*this, divisor, &quotient, &remainder);
+	*this = quotient;
+	return *this;
+}
+inline constexpr uint128& uint128::operator%=(const uint128& divisor) {
+	uint128 quotient = 0;
+	uint128 remainder = 0;
+	DivModImpl(*this, divisor, &quotient, &remainder);
+	*this = remainder;
+	return *this;
+}
+
+inline std::ostream& operator<<(std::ostream& o, const uint128& b) {
+	std::ios_base::fmtflags flags = o.flags();
+
+	// Select a divisor which is the largest power of the base < 2^64.
+	uint128 div;
+	int div_base_log;
+	switch (flags & std::ios::basefield) {
+	case std::ios::hex:
+		div = 0x1000000000000000;  // 16^15
+		div_base_log = 15;
+		break;
+	case std::ios::oct:
+		div = 01000000000000000000000;  // 8^21
+		div_base_log = 21;
+		break;
+	default:  // std::ios::dec
+		div = 10000000000000000000u;  // 10^19
+		div_base_log = 19;
+		break;
+	}
+
+	// Now piece together the uint128 representation from three chunks of
+	// the original value, each less than "div" and therefore representable
+	// as a uint64_t.
+	std::ostringstream os;
+	std::ios_base::fmtflags copy_mask =
+		std::ios::basefield | std::ios::showbase | std::ios::uppercase;
+	os.setf(flags & copy_mask, copy_mask);
+	uint128 high = b;
+	uint128 low;
+	DivModImpl(high, div, &high, &low);
+	uint128 mid;
+	DivModImpl(high, div, &high, &mid);
+	if (Uint128Low64(high) != 0) {
+		os << Uint128Low64(high);
+		os << std::noshowbase << std::setfill('0') << std::setw(div_base_log);
+		os << Uint128Low64(mid);
+		os << std::setw(div_base_log);
+	}
+	else if (Uint128Low64(mid) != 0) {
+		os << Uint128Low64(mid);
+		os << std::noshowbase << std::setfill('0') << std::setw(div_base_log);
+	}
+	os << Uint128Low64(low);
+	std::string rep = os.str();
+
+	// Add the requisite padding.
+	std::streamsize width = o.width(0);
+	if (static_cast<size_t>(width) > rep.size()) {
+		if ((flags & std::ios::adjustfield) == std::ios::left) {
+			rep.append(width - rep.size(), o.fill());
+		}
+		else {
+			rep.insert(0, width - rep.size(), o.fill());
+		}
+	}
+
+	// Stream the final representation in a single "<<" call.
+	return o << rep;
 }
 
 
-template <typename UInt, typename UIntX2>
-uint_x4<UInt,UIntX2> operator*(const uint_x4<UInt,UIntX2>& a,
-                               const uint_x4<UInt,UIntX2>& b)
-{
-    uint_x4<UInt,UIntX2> r = {0U, 0U, 0U, 0U};
-    bool carryin = false;
-    bool carryout;
-    UIntX2 a0b0 = UIntX2(a.w.v0) * UIntX2(b.w.v0);
-    r.w.v0 = UInt(a0b0);
-    r.w.v1 = UInt(a0b0 >> 32);
-
-    UIntX2 a1b0 = UIntX2(a.w.v1) * UIntX2(b.w.v0);
-    r.w.v2 = UInt(a1b0 >> 32);
-    r.w.v1 = addwithcarry(r.w.v1, UInt(a1b0), carryin, &carryout);
-    carryin = carryout;
-    r.w.v2 = addwithcarry(r.w.v2, UInt(0U), carryin, &carryout);
-    carryin = carryout;
-    r.w.v3 = addwithcarry(r.w.v3, UInt(0U), carryin, &carryout);
-
-    UIntX2 a0b1 = UIntX2(a.w.v0) * UIntX2(b.w.v1);
-    carryin = false;
-    r.w.v2 = addwithcarry(r.w.v2, UInt(a0b1 >> 32), carryin, &carryout);
-    carryin = carryout;
-    r.w.v3 = addwithcarry(r.w.v3, UInt(0U), carryin, &carryout);
-
-    carryin = false;
-    r.w.v1 = addwithcarry(r.w.v1, UInt(a0b1), carryin, &carryout);
-    carryin = carryout;
-    r.w.v2 = addwithcarry(r.w.v2, UInt(0U), carryin, &carryout);
-    carryin = carryout;
-    r.w.v3 = addwithcarry(r.w.v3, UInt(0U), carryin, &carryout);
-
-    UIntX2 a1b1 = UIntX2(a.w.v1) * UIntX2(b.w.v1);
-    carryin = false;
-    r.w.v2 = addwithcarry(r.w.v2, UInt(a1b1), carryin, &carryout);
-    carryin = carryout;
-    r.w.v3 = addwithcarry(r.w.v3, UInt(a1b1 >> 32), carryin, &carryout);
-
-    r.d.v23 += a.d.v01 * b.d.v23 + a.d.v23 * b.d.v01;
-
-    return r;
-}
-
-
-template <typename UInt, typename UIntX2>
-uint_x4<UInt,UIntX2> operator+(const uint_x4<UInt,UIntX2>& a,
-                               const uint_x4<UInt,UIntX2>& b)
-{
-    uint_x4<UInt,UIntX2> r = {0U, 0U, 0U, 0U};
-
-    bool carryin = false;
-    bool carryout;
-    r.w.v0 = addwithcarry(a.w.v0, b.w.v0, carryin, &carryout);
-    carryin = carryout;
-    r.w.v1 = addwithcarry(a.w.v1, b.w.v1, carryin, &carryout);
-    carryin = carryout;
-    r.w.v2 = addwithcarry(a.w.v2, b.w.v2, carryin, &carryout);
-    carryin = carryout;
-    r.w.v3 = addwithcarry(a.w.v3, b.w.v3, carryin, &carryout);
-
-    return r;
-}
-
-template <typename UInt, typename UIntX2>
-uint_x4<UInt,UIntX2> operator-(const uint_x4<UInt,UIntX2>& a,
-                               const uint_x4<UInt,UIntX2>& b)
-{
-    uint_x4<UInt,UIntX2> r = {0U, 0U, 0U, 0U};
-
-    bool carryin = false;
-    bool carryout;
-    r.w.v0 = subwithcarry(a.w.v0, b.w.v0, carryin, &carryout);
-    carryin = carryout;
-    r.w.v1 = subwithcarry(a.w.v1, b.w.v1, carryin, &carryout);
-    carryin = carryout;
-    r.w.v2 = subwithcarry(a.w.v2, b.w.v2, carryin, &carryout);
-    carryin = carryout;
-    r.w.v3 = subwithcarry(a.w.v3, b.w.v3, carryin, &carryout);
-
-    return r;
-}
-
-
-template <typename UInt, typename UIntX2>
-uint_x4<UInt,UIntX2> operator&(const uint_x4<UInt,UIntX2>& a,
-                               const uint_x4<UInt,UIntX2>& b)
-{
-    return uint_x4<UInt,UIntX2>(a.d.v23 & b.d.v23, a.d.v01 & b.d.v01);
-}
-
-template <typename UInt, typename UIntX2>
-uint_x4<UInt,UIntX2> operator|(const uint_x4<UInt,UIntX2>& a,
-                               const uint_x4<UInt,UIntX2>& b)
-{
-    return uint_x4<UInt,UIntX2>(a.d.v23 | b.d.v23, a.d.v01 | b.d.v01);
-}
-
-template <typename UInt, typename UIntX2>
-uint_x4<UInt,UIntX2> operator^(const uint_x4<UInt,UIntX2>& a,
-                               const uint_x4<UInt,UIntX2>& b)
-{
-    return uint_x4<UInt,UIntX2>(a.d.v23 ^ b.d.v23, a.d.v01 ^ b.d.v01);
-}
-
-template <typename UInt, typename UIntX2>
-uint_x4<UInt,UIntX2> operator~(const uint_x4<UInt,UIntX2>& v)
-{
-    return uint_x4<UInt,UIntX2>(~v.d.v23, ~v.d.v01);
-}
-
-template <typename UInt, typename UIntX2>
-uint_x4<UInt,UIntX2> operator-(const uint_x4<UInt,UIntX2>& v)
-{
-    return uint_x4<UInt,UIntX2>(0UL,0UL) - v;
-}
-
-template <typename UInt, typename UIntX2>
-bool operator==(const uint_x4<UInt,UIntX2>& a, const uint_x4<UInt,UIntX2>& b)
-{
-    return (a.d.v01 == b.d.v01) && (a.d.v23 == b.d.v23);
-}
-
-template <typename UInt, typename UIntX2>
-bool operator!=(const uint_x4<UInt,UIntX2>& a, const uint_x4<UInt,UIntX2>& b)
-{
-    return !operator==(a,b);
-}
-
-
-template <typename UInt, typename UIntX2>
-bool operator<(const uint_x4<UInt,UIntX2>& a, const uint_x4<UInt,UIntX2>& b)
-{
-    return (a.d.v23 < b.d.v23)
-           || ((a.d.v23 == b.d.v23) && (a.d.v01 < b.d.v01));
-}
-
-template <typename UInt, typename UIntX2>
-bool operator>(const uint_x4<UInt,UIntX2>& a, const uint_x4<UInt,UIntX2>& b)
-{
-    return operator<(b,a);
-}
-
-template <typename UInt, typename UIntX2>
-bool operator<=(const uint_x4<UInt,UIntX2>& a, const uint_x4<UInt,UIntX2>& b)
-{
-    return !(operator<(b,a));
-}
-
-template <typename UInt, typename UIntX2>
-bool operator>=(const uint_x4<UInt,UIntX2>& a, const uint_x4<UInt,UIntX2>& b)
-{
-    return !(operator<(a,b));
-}
-
-
-
-template <typename UInt, typename UIntX2>
-uint_x4<UInt,UIntX2> operator<<(const uint_x4<UInt,UIntX2>& v,
-                                const bitcount_t shift)
-{
-    uint_x4<UInt,UIntX2> r = {0U, 0U, 0U, 0U};
-    const bitcount_t bits    = sizeof(UInt) * CHAR_BIT;
-    const bitcount_t bitmask = bits - 1;
-    const bitcount_t shiftdiv = shift / bits;
-    const bitcount_t shiftmod = shift & bitmask;
-
-    if (shiftmod) {
-        UInt carryover = 0;
-#if PCG_LITTLE_ENDIAN
-        for (uint8_t out = shiftdiv, in = 0; out < 4; ++out, ++in) {
-#else
-        for (uint8_t out = 4-shiftdiv, in = 4; out != 0; /* dec in loop */) {
-            --out, --in;
-#endif
-            r.wa[out] = (v.wa[in] << shiftmod) | carryover;
-            carryover = (v.wa[in] >> (bits - shiftmod));
-        }
-    } else {
-#if PCG_LITTLE_ENDIAN
-        for (uint8_t out = shiftdiv, in = 0; out < 4; ++out, ++in) {
-#else
-        for (uint8_t out = 4-shiftdiv, in = 4; out != 0; /* dec in loop */) {
-            --out, --in;
-#endif
-            r.wa[out] = v.wa[in];
-        }
-    }
-
-    return r;
-}
-
-template <typename UInt, typename UIntX2>
-uint_x4<UInt,UIntX2> operator>>(const uint_x4<UInt,UIntX2>& v,
-                                const bitcount_t shift)
-{
-    uint_x4<UInt,UIntX2> r = {0U, 0U, 0U, 0U};
-    const bitcount_t bits    = sizeof(UInt) * CHAR_BIT;
-    const bitcount_t bitmask = bits - 1;
-    const bitcount_t shiftdiv = shift / bits;
-    const bitcount_t shiftmod = shift & bitmask;
-
-    if (shiftmod) {
-        UInt carryover = 0;
-#if PCG_LITTLE_ENDIAN
-        for (uint8_t out = 4-shiftdiv, in = 4; out != 0; /* dec in loop */) {
-            --out, --in;
-#else
-        for (uint8_t out = shiftdiv, in = 0; out < 4; ++out, ++in) {
-#endif
-            r.wa[out] = (v.wa[in] >> shiftmod) | carryover;
-            carryover = (v.wa[in] << (bits - shiftmod));
-        }
-    } else {
-#if PCG_LITTLE_ENDIAN
-        for (uint8_t out = 4-shiftdiv, in = 4; out != 0; /* dec in loop */) {
-            --out, --in;
-#else
-        for (uint8_t out = shiftdiv, in = 0; out < 4; ++out, ++in) {
-#endif
-            r.wa[out] = v.wa[in];
-        }
-    }
-
-    return r;
-}
 
 } // namespace pcg_extras
 
