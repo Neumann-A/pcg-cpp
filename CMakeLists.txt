@@ -17,7 +17,8 @@ include_directories(${CMAKE_CURRENT_SOURCE_DIR}/include)
 
 target_compile_features(${PROJECT_NAME} INTERFACE cxx_constexpr)
 
-
+SET(INCLUDE_INSTALL_DIR "${CMAKE_INSTALL_PREFIX}/include" CACHE PATH "The directory the headers are installed in")
+SET(LIB_INSTALL_DIR "${CMAKE_INSTALL_PREFIX}/lib" CACHE STRING "Directory where lib will install")
 
 #Export as Package
 
@@ -29,7 +30,7 @@ CONFIGURE_FILE(${CMAKE_MODULE_PATH}/${PROJECT_NAME}ConfigVersion.cmake.in
     ${PROJECT_NAME}ConfigVersion.cmake
     @ONLY)
 	
-SET(LIB_INSTALL_DIR "${CMAKE_INSTALL_PREFIX}/lib" CACHE STRING "Directory where lib will install")
+
 IF(UNIX OR CYGWIN)
     SET(_CMAKE_INSTALL_DIR "${LIB_INSTALL_DIR}/cmake/${PROJECT_NAME}")
 ELSEIF(WIN32)
