@@ -18,7 +18,6 @@ target_compile_features(${PROJECT_NAME} INTERFACE cxx_constexpr)
 
 SET(INCLUDE_INSTALL_DIR "${CMAKE_INSTALL_PREFIX}/include" CACHE PATH "The directory the headers are installed in")
 SET(LIB_INSTALL_DIR "${CMAKE_INSTALL_PREFIX}/lib" CACHE STRING "Directory where lib will install")
-set(CMAKEPACKAGE_INSTALL_DIR "${CMAKE_INSTALL_DATADIR}/pcg-cpp/cmake" CACHE PATH "The directory relative to CMAKE_PREFIX_PATH where pcg-cppConfig.cmake is installed")
 	
 #Export as Package
 set_target_properties (${PROJECT_NAME} PROPERTIES EXPORT_NAME pcg)
@@ -43,9 +42,8 @@ SET(CMAKE_INSTALL_DIR "${_CMAKE_INSTALL_DIR}" CACHE PATH "The directory cmake fi
 INSTALL(FILES
     ${CMAKE_CURRENT_BINARY_DIR}/${PROJECT_NAME}Config.cmake
     ${CMAKE_CURRENT_BINARY_DIR}/${PROJECT_NAME}ConfigVersion.cmake
-	${CMAKE_CURRENT_BINARY_DIR}/${PROJECT_NAME}Targets.cmake
     DESTINATION "${CMAKE_INSTALL_DIR}"
     COMPONENT dev)
 	
 install (TARGETS ${PROJECT_NAME} EXPORT ${PROJECT_NAME}Targets)
-install (EXPORT ${PROJECT_NAME}Targets NAMESPACE ${PROJECT_NAME}:: DESTINATION ${CMAKEPACKAGE_INSTALL_DIR})
+install (EXPORT ${PROJECT_NAME}Targets NAMESPACE ${PROJECT_NAME}:: DESTINATION ${CMAKE_INSTALL_DIR})
