@@ -17,6 +17,8 @@ include_directories(${CMAKE_CURRENT_SOURCE_DIR}/include)
 
 target_compile_features(${PROJECT_NAME} INTERFACE cxx_constexpr)
 
+
+
 #Export as Package
 
 export(PACKAGE ${PROJECT_NAME})
@@ -26,6 +28,15 @@ CONFIGURE_FILE(${CMAKE_MODULE_PATH}/${PROJECT_NAME}Config.cmake.in
 CONFIGURE_FILE(${CMAKE_MODULE_PATH}/${PROJECT_NAME}ConfigVersion.cmake.in
     ${PROJECT_NAME}ConfigVersion.cmake
     @ONLY)
+	
+SET(LIB_INSTALL_DIR "${CMAKE_INSTALL_PREFIX}/lib" CACHE STRING "Directory where lib will install")
+IF(UNIX OR CYGWIN)
+    SET(_CMAKE_INSTALL_DIR "${LIB_INSTALL_DIR}/cmake/${PROJECT_NAME}")
+ELSEIF(WIN32)
+    SET(_CMAKE_INSTALL_DIR "${CMAKE_INSTALL_PREFIX}/cmake")
+ENDIF()
+SET(CMAKE_INSTALL_DIR "${_CMAKE_INSTALL_DIR}" CACHE PATH "The directory cmake fiels are installed in")
+	
 INSTALL(FILES
     ${CMAKE_CURRENT_BINARY_DIR}/${PROJECT_NAME}Config.cmake
     ${CMAKE_CURRENT_BINARY_DIR}/${PROJECT_NAME}ConfigVersion.cmake
